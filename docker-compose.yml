@@ -31,12 +31,12 @@ services:
       - gis
     environment:
       - PGPASSWORD=n7m-geocoding
-      - OSM_FILENAME=monaco-latest.osm.pbf
-      - NOMINATIM_REPLICATION_URL=https://download.geofabrik.de/europe/monaco-updates
+      - OSM_FILENAME=ireland-and-northern-ireland-251031.osm.pbf
+      - NOMINATIM_REPLICATION_URL=https://download.geofabrik.de/europe/ireland-and-northern-ireland-updates
       - NOMINATIM_REPLICATION_MAX_DIFF=3000
       - NOMINATIM_REPLICATION_UPDATE_INTERVAL=86400
     volumes:
-      - ./data:/data/
+      - /Volumes/Onyx_Cinder/n7m/data/:/data/
   gis:
     build: gis
     image: smithmicro/n7m-gis

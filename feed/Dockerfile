@@ -1,10 +1,12 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 
-ENV NOMINATIM_VERSION=4.5.0
+ENV NOMINATIM_VERSION=5.2.0
 
 # https://nominatim.org/release-docs/latest/admin/Install-on-Ubuntu-24/
 
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     g++ \
     libicu-dev \
     osm2pgsql>=1.8 \
@@ -24,6 +26,8 @@ ENV PGHOST=gis \
     PGPASSWORD=change-this-password \
     OSM_FILENAME=
 
+RUN useradd -ms /bin/bash -d /nominatim nominatim
+USER nominatim
 WORKDIR /nominatim
 
 # copy shell scripts
