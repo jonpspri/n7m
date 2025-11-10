@@ -1,0 +1,215 @@
+---
+- name: Create EFS targets list
+  ansible.builtin.set_fact:
+    efs_targets_f: >- 
+      {{ (efs_targets_f | default([]) ) + [ { 'subnet_id': item, 'security_groups': [ security_group_v ] } ] }}
+  loop: "{{ subnets_v }}"
+
+- name: Allocate /data efs partition
+  community.aws.efs:
+    state: "present"
+    name: "{{ prefix_v }}-data"
+    targets: "{{ efs_targets_f }}"
+  register: efs_data_r
+
+- name: Create an execution role for the containers
+  amazon.aws.iam_role:
+    name: "{{ prefix_v }}-container-execution-role"
+    assume_role_policy_document: |
+        {
+          "Version":"2012-10-17",
+          "Statement": [
+            {
+              "Sid": "",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+    managed_policies:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  register: execution_role_r
+
+- name: Allocate osm download task_definition
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-download-osm"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+    containers:
+      - name: openmaptiles-tools
+        image: "openmaptiles/openmaptiles-tools:latest"
+        mountPoints:
+          - sourceVolume: data
+            containerPath: '/tileset'
+            readOnly: false
+        command:
+          - download-osm
+          - "{{ osm_region_v }}"
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+    volumes:
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+
+- name: Post-process the download file into a UID/GID mount point
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-efs-configurator"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+    containers:
+      - name: feed
+        image: debian:bookworm-slim
+        command:
+          - /bin/bash
+          - -x
+          - -c
+          - >
+              rm -rf /data/{{ prefix_v }} || /bin/true
+              mkdir /data/{{ prefix_v }} 
+              mv /data/*.osm.pbf /data/{{ prefix_v }}/
+              chown -R 1001:1001 /data/{{ prefix_v }}
+              rm /data/*.pbf
+        mountPoints:
+          - sourceVolume: data
+            containerPath: '/data'
+            readOnly: false
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+    volumes:
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+
+- name: Allocate grid and wiki download task_definition
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-download-wiki-and-grid"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+    containers:
+      - name: feed
+        image: "ghcr.io/jonpspri/n7m-feed:latest"
+        command:
+          - download
+          - --wiki
+          - --grid
+        mountPoints:
+          - sourceVolume: data
+            containerPath: '/data'
+            readOnly: false
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+    volumes:
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+          rootDirectory: "/{{ prefix_v }}"
+
+- name: Allocate an ECS cluster for load execution
+  community.aws.ecs_cluster:
+    name: "{{ prefix_v }}-ecs-cluster"
+    state: "present"
+    capacity_providers:
+      - FARGATE 
+      - FARGATE_SPOT
+    capacity_provider_strategy:
+      - capacity_provider: FARGATE
+        base: 1
+        weight: 1
+      - capacity_provider: FARGATE_SPOT
+        weight: 100
+    purge_capacity_providers: true
+
+- name: Download the map data for selected region
+  ecs_task:
+    operation: run
+    count: 1
+    started_by: Ansible automation
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    task_definition: "{{ prefix_v }}-download-osm"
+    launch_type: FARGATE
+    network_configuration:
+      assign_public_ip: true
+      subnets: "{{ subnets_v }}"
+    wait_complete: true
+  register: osm_task_r
+
+- name: Check OSM download result
+  ansible.builtin.fail:
+    msg: "OSM download task failed: {{ osm_task_r.task[0].stoppedReason | default('Unknown reason') }}"
+  when: >
+    osm_task_r.task[0].stopCode is defined and
+    osm_task_r.task[0].stopCode != 'EssentialContainerExited' or
+    osm_task_r.task[0].containers[0].exitCode | default(1) != 0
+
+- name: Configurate the EFS mount
+  ecs_task:
+    operation: run
+    count: 1
+    started_by: Ansible automation
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    task_definition: "{{ prefix_v }}-efs-configurator"
+    launch_type: FARGATE
+    network_configuration:
+      assign_public_ip: true
+      subnets: "{{ subnets_v }}"
+    wait_complete: true
+  register: configurator_task_r
+
+- name: Check OSM download result
+  ansible.builtin.fail:
+    msg: "Configurator task failed: {{ configurator_task_r.task[0].stoppedReason | default('Unknown reason') }}"
+  when: >
+    configurator_task_r.task[0].stopCode is defined and
+    configurator_task_r.task[0].stopCode != 'EssentialContainerExited' or
+    configurator_task_r.task[0].containers[0].exitCode | default(1) != 0
+
+- name: Load the grid and wiki data
+  ecs_task:
+    operation: run
+    count: 1
+    started_by: Ansible automation
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    task_definition: "{{ prefix_v }}-download-wiki-and-grid"
+    launch_type: FARGATE
+    network_configuration:
+      assign_public_ip: true
+      subnets: "{{ subnets_v }}"
+    wait_complete: true
+  register: grid_wiki_task_r
+
+- name: Check grid and wiki data load result
+  ansible.builtin.fail:
+    msg: "Grid/wiki download task failed: {{ grid_wiki_task_r.task[0].stoppedReason | default('Unknown reason') }}"
+  when: >
+    grid_wiki_task_r.task[0].stopCode is defined and
+    grid_wiki_task_r.task[0].stopCode != 'EssentialContainerExited' or
+    grid_wiki_task_r.task[0].containers[0].exitCode | default(1) != 0
+
