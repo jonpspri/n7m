@@ -1,0 +1,143 @@
+---
+- name: Retreive account information
+  amazon.aws.aws_caller_info:
+  register: aws_caller_info_r
+
+- name: Create IAM role for ECS Task execution
+  amazon.aws.iam_role:
+    name: "{{ prefix_v }}-ecs-task-role"
+    description: "Ansible install of ECS Tasks to run for data load"
+    assume_role_policy_document: "{{  lookup('template', 'role_policy.json.j2') }}"
+    managed_policies:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForVolumes
+      - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForServiceConnectTransportLayerSecurity
+      - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForManagedInstances
+
+  register: iam_role_r
+
+- name: Create instance profile for ECS Task scaling
+  amazon.aws.iam_instance_profile:
+    name: "{{ prefix_v }}-ecs-instance-profile"
+    role: "{{ prefix_v }}-ecs-task-role"
+  register: iam_instance_profile_r
+
+- name: Create EFS targets list
+  ansible.builtin.set_fact:
+    efs_targets_f: >- 
+      {{ (efs_targets_f | default([]) ) + [ { 'subnet_id': item, 'security_groups': [ security_group_v ] } ] }}
+  loop: "{{ subnets_v }}"
+
+- name: Allocate /data efs partition
+  community.aws.efs:
+    state: "present"
+    name: "{{ prefix_v }}-data"
+    targets: "{{ efs_targets_f }}"
+  register: efs_data_r
+
+- name: Dump EFS details
+  ansible.builtin.debug:
+    var: efs_data_r
+
+- name: Allocate grid and wiki download task_definition
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-download-wiki-and-grid"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    containers:
+      - name: feed
+        image: "ghcr.io/jonpspri/n7m-feed:latest"
+        mountPoints:
+          - sourceVolume: data
+            containerPath: '/data'
+            readOnly: false
+    volumes: 
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+
+- name: Allocate osm download task_definition
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-download-osm"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    containers:
+      - name: openmaptiles-tools
+        image: "openmaptiles/openmaptiles-tools:latest"
+        mountPoints:
+          - sourceVolume: data
+            containerPath: '/tileset'
+            readOnly: false
+        command:
+          - download-owm
+          - "{{ osm_region_v }}"
+    volumes: 
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+
+- name: Allocate an ECS cluster for load execution
+  community.aws.ecs_cluster:
+    name: "{{ prefix_v }}-ecs-cluster"
+    state: "present"
+    capacity_providers:
+      - FARGATE
+      - FARGATE_SPOT
+    capacity_provider_strategy:
+      - capacity_provider: FARGATE
+        base: 1
+        weight: 1
+      - capacity_provider: FARGATE_SPOT
+        weight: 100
+    purge_capacity_providers: true
+
+- name: Fill in managed instances provider details
+  ansible.builtin.template:
+    src: ../templates/managed_instances_provider.yaml.j2
+    dest: /tmp/managed_instances_provider.yaml
+
+- name: Allocate an ECS capacity provider
+  ecs_capacityprovider:
+    name: "{{ prefix_v }}-ecs-capacity-provider"
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    state: "present"
+    managed_instances_provider: 
+      infrastructure_role_arn: "{{ iam_role_r.iam_role.arn }}"
+      instance_launch_template:
+        ec2_instance_profile_arn: "{{ iam_instance_profile_r.iam_instance_profile.arn }}"
+        network_configuration:
+          subnets: "{{ subnets_v }}"
+          security_groups: :1
+            - "{{ security_group_v }}"
+        instance_requirements:
+          vcpu_count: { min: 2 }
+          memory_mib: { min: 4096 }
+
+- name: Load the grid and wiki data
+  community.aws.ecs_task:
+    operation: run
+    count: 1
+    started_by: Ansible automation
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    task_definition: "{{ prefix_v }}-download-wiki-and-grid"
+    launch_type: FARGATE
+    network_configuration:
+      assign_public_ip: false
+      subnets: "{{ subnets_v }}"
+
+- name: Download the map data for selected region
+  community.aws.ecs_task:
+    operation: run
+    count: 1
+    started_by: Ansible automation
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    task_definition: "{{ prefix_v }}-download-osm"
+    launch_type: FARGATE
+    network_configuration:
+      assign_public_ip: false
+      subnets: "{{ subnets_v }}"
