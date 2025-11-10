@@ -1,0 +1,11 @@
+---
+infrastructure_role_arn: "{{ iam_role_r.iam_role.arn }}"
+instance_launch_template:
+  ec2_instance_profile_arn: "{{ iam_instance_profile_r.iam_instance_profile.arn }}"
+  network_configuration:
+    subnets: "{{ subnets_v }}"
+    security_groups: :1
+      - "{{ security_group_v }}"
+  instance_requirements:
+    vcpu_count: { min: 2 }
+    memory_mib: { min: 4096 }
