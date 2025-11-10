@@ -1,0 +1,14 @@
+---
+#
+#  Note that we do NOT deallocate the tasks because they're revisioned in Amazon,
+#  and there's no charge for their definition.  That may change
+#
+- name: Deallocate ECS cluster
+  community.aws.ecs_cluster:
+    name: "{{ prefix_v }}-ecs-cluster"
+    state: absent
+
+- name: Deallocate EFS partition
+  community.aws.efs:
+    name: "{{ prefix_v }}-data"
+    state: absent

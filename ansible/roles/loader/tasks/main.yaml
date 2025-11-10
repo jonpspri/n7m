@@ -1,0 +1,7 @@
+---
+- ansible.builtin.assert:
+    that: state == 'present' or state == 'absent'
+- ansible.builtin.include_tasks: up.yaml
+  when: state == 'present'
+- ansible.builtin.include_tasks: down.yaml
+  when: state == 'absent'
