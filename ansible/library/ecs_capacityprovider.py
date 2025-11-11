@@ -859,9 +859,15 @@ def build_update_params(module, changes):
             params["autoScalingGroupProvider"] = asg_provider
 
     if "managed_instances_provider" in changes:
-        params["managedInstancesProvider"] = prepare_params_for_boto3(
-            changes["managed_instances_provider"]
-        )
+        # For managed instances provider updates, AWS requires all required fields
+        # to be present, not just the ones that changed. Merge changes with original params.
+        managed_provider = module.params.get("managed_instances_provider", {}).copy()
+        managed_provider.update(changes["managed_instances_provider"])
+        params["managedInstancesProvider"] = prepare_params_for_boto3(managed_provider)
+
+        # Cluster is also required for managed instances provider updates
+        if module.params.get("cluster"):
+            params["cluster"] = module.params["cluster"]
 
     return params
 

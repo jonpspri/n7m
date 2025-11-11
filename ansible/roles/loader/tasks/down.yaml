@@ -3,12 +3,51 @@
 #  Note that we do NOT deallocate the tasks because they're revisioned in Amazon,
 #  and there's no charge for their definition.  That may change
 #
+
+# First, remove capacity providers from the cluster (required before deletion)
+- name: Remove capacity providers from ECS cluster
+  community.aws.ecs_cluster:
+    name: "{{ prefix_v }}-ecs-cluster"
+    state: "present"
+    capacity_providers: []
+    capacity_provider_strategy: []
+    purge_capacity_providers: true
+
+# Now delete the capacity provider
+- name: Deallocate ECS capacity provider
+  ecs_capacityprovider:
+    name: "{{ prefix_v }}-ecs-capacity-provider"
+    state: absent
+
+# Wait for capacity provider to fully deprovision
+- name: Wait for capacity provider deprovisioning
+  ansible.builtin.pause:
+    seconds: 30
+    prompt: "Waiting for capacity provider to fully deprovision..."
+
+# Finally delete the cluster (with retry in case capacity provider is still deprovisioning)
 - name: Deallocate ECS cluster
   community.aws.ecs_cluster:
     name: "{{ prefix_v }}-ecs-cluster"
     state: absent
+  register: cluster_delete_result
+  retries: 10
+  delay: 10
+  until: cluster_delete_result is succeeded
 
+# Delete the EFS file system
 - name: Deallocate EFS partition
   community.aws.efs:
     name: "{{ prefix_v }}-data"
+    state: absent
+
+# Clean up IAM resources (no charge, but good practice)
+- name: Delete IAM instance profile
+  amazon.aws.iam_instance_profile:
+    name: "{{ prefix_v }}-ecs-instance-profile"
+    state: absent
+
+- name: Delete IAM role
+  amazon.aws.iam_role:
+    name: "{{ prefix_v }}-ecs-task-role"
     state: absent
