@@ -81,37 +81,9 @@ options:
     launch_type:
         description:
           - The launch type on which to run your service.
-          - Mutually exclusive with I(capacity_provider_strategy).
         required: false
         choices: ["EC2", "FARGATE"]
         type: str
-    capacity_provider_strategy:
-        description:
-          - The capacity provider strategy to use for the task.
-          - When using this parameter, do not specify I(launch_type).
-          - Only supported for I(operation=run).
-        required: false
-        type: list
-        elements: dict
-        suboptions:
-            capacity_provider:
-                description:
-                  - The short name of the capacity provider.
-                required: true
-                type: str
-            weight:
-                description:
-                  - The weight value designates the relative percentage of the total number of tasks launched.
-                  - Must be between 0 and 1000.
-                required: false
-                type: int
-            base:
-                description:
-                  - The base value designates how many tasks, at a minimum, to run on the specified capacity provider.
-                  - Only one capacity provider in a strategy can have a base defined.
-                  - Must be between 0 and 100000.
-                required: false
-                type: int
     tags:
         type: dict
         description:
@@ -121,6 +93,15 @@ options:
     wait:
         description:
           - Whether or not to wait for the desired state.
+        type: bool
+        default: false
+        version_added: 4.1.0
+    wait_complete:
+        description:
+          - Whether to wait for the task to complete execution and capture container exit codes.
+          - When enabled, waits for all containers in the task to finish and includes exit codes in results.
+          - Only applicable for I(operation=run) and I(operation=start).
+          - Implies I(wait=true) to ensure task starts before waiting for completion.
         type: bool
         default: false
         version_added: 4.1.0
@@ -196,30 +177,33 @@ EXAMPLES = r"""
         - subnet-abcd1234
   register: task_output
 
-- name: RUN a task using capacity provider strategy
-  community.aws.ecs_task:
-    operation: run
-    cluster: console-sample-app-static-cluster
-    task_definition: console-sample-app-static-taskdef
-    count: 1
-    started_by: ansible_user
-    capacity_provider_strategy:
-      - capacity_provider: my-capacity-provider
-        weight: 1
-        base: 0
-    network_configuration:
-      subnets:
-        - subnet-abcd1234
-      security_groups:
-        - sg-aaaa1111
-  register: task_output
-
 - name: Stop a task
   community.aws.ecs_task:
     operation: stop
     cluster: console-sample-app-static-cluster
     task_definition: console-sample-app-static-taskdef
     task: "arn:aws:ecs:us-west-2:123456789012:task/3f8353d1-29a8-4689-bbf6-ad79937ffe8a"
+
+- name: Run a task and wait for it to complete
+  community.aws.ecs_task:
+    operation: run
+    cluster: console-sample-app-static-cluster
+    task_definition: console-sample-app-static-taskdef
+    count: 1
+    started_by: ansible_user
+    launch_type: FARGATE
+    network_configuration:
+      subnets:
+        - subnet-abcd1234
+      security_groups:
+        - sg-aaaa1111
+    wait_complete: true
+  register: task_output
+
+# Access task completion details:
+# - task_output.task[0].stopCode (e.g., "EssentialContainerExited", "TaskFailedToStart")
+# - task_output.task[0].stoppedReason (human-readable explanation)
+# - task_output.task[0].containers[0].exitCode (container exit code)
 """
 
 RETURN = r"""
@@ -286,6 +270,15 @@ task:
             description: The launch type on which to run your task.
             returned: always
             type: str
+        stopCode:
+            description: The stop code indicating why the task was stopped.
+            returned: when wait_complete is true and task has stopped
+            type: str
+        containers:
+            description: Details about containers in the task, including exitCode for each container.
+            returned: when wait_complete is true and task has stopped
+            type: list
+            elements: dict
 """
 
 try:
@@ -293,16 +286,10 @@ try:
 except ImportError:
     pass  # caught by AnsibleAWSModule
 
-from ansible_collections.amazon.aws.plugins.module_utils.ec2 import (
-    get_ec2_security_group_ids_from_names,
-)
-from ansible_collections.amazon.aws.plugins.module_utils.tagging import (
-    ansible_dict_to_boto3_tag_list,
-)
+from ansible_collections.amazon.aws.plugins.module_utils.ec2 import get_ec2_security_group_ids_from_names
+from ansible_collections.amazon.aws.plugins.module_utils.tagging import ansible_dict_to_boto3_tag_list
 
-from ansible_collections.community.aws.plugins.module_utils.modules import (
-    AnsibleCommunityAWSModule as AnsibleAWSModule,
-)
+from ansible_collections.community.aws.plugins.module_utils.modules import AnsibleCommunityAWSModule as AnsibleAWSModule
 
 
 class EcsExecManager:
@@ -323,16 +310,9 @@ class EcsExecManager:
             groups = network_config["security_groups"]
             if any(not sg.startswith("sg-") for sg in groups):
                 try:
-                    vpc_id = self.ec2.describe_subnets(
-                        SubnetIds=[result["subnets"][0]]
-                    )["Subnets"][0]["VpcId"]
-                    groups = get_ec2_security_group_ids_from_names(
-                        groups, self.ec2, vpc_id
-                    )
-                except (
-                    botocore.exceptions.ClientError,
-                    botocore.exceptions.BotoCoreError,
-                ) as e:
+                    vpc_id = self.ec2.describe_subnets(SubnetIds=[result["subnets"][0]])["Subnets"][0]["VpcId"]
+                    groups = get_ec2_security_group_ids_from_names(groups, self.ec2, vpc_id)
+                except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
                     self.module.fail_json_aws(e, msg="Couldn't look up security groups")
             result["securityGroups"] = groups
         if "assign_public_ip" in network_config:
@@ -355,25 +335,11 @@ class EcsExecManager:
                     return c
         return None
 
-    def run_task(
-        self,
-        cluster,
-        task_definition,
-        overrides,
-        count,
-        startedBy,
-        launch_type,
-        tags,
-        capacity_provider_strategy,
-    ):
+    def run_task(self, cluster, task_definition, overrides, count, startedBy, launch_type, tags):
         if overrides is None:
             overrides = dict()
         params = dict(
-            cluster=cluster,
-            taskDefinition=task_definition,
-            overrides=overrides,
-            count=count,
-            startedBy=startedBy,
+            cluster=cluster, taskDefinition=task_definition, overrides=overrides, count=count, startedBy=startedBy
         )
         if self.module.params["network_configuration"]:
             params["networkConfiguration"] = self.format_network_configuration(
@@ -381,35 +347,18 @@ class EcsExecManager:
             )
         if launch_type:
             params["launchType"] = launch_type
-        if capacity_provider_strategy:
-            # Convert capacity_provider to capacityProvider for AWS API
-            params["capacityProviderStrategy"] = []
-            for strategy in capacity_provider_strategy:
-                strategy_item = {
-                    "capacityProvider": strategy["capacity_provider"]
-                }
-                if "weight" in strategy and strategy["weight"] is not None:
-                    strategy_item["weight"] = strategy["weight"]
-                if "base" in strategy and strategy["base"] is not None:
-                    strategy_item["base"] = strategy["base"]
-                params["capacityProviderStrategy"].append(strategy_item)
         if tags:
             params["tags"] = ansible_dict_to_boto3_tag_list(tags, "key", "value")
 
             # TODO: need to check if long arn format enabled.
         try:
             response = self.ecs.run_task(**params)
-        except (
-            botocore.exceptions.ClientError,
-            botocore.exceptions.BotoCoreError,
-        ) as e:
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
             self.module.fail_json_aws(e, msg="Couldn't run task")
         # include tasks and failures
         return response["tasks"]
 
-    def start_task(
-        self, cluster, task_definition, overrides, container_instances, startedBy, tags
-    ):
+    def start_task(self, cluster, task_definition, overrides, container_instances, startedBy, tags):
         args = dict()
         if cluster:
             args["cluster"] = cluster
@@ -429,10 +378,7 @@ class EcsExecManager:
             args["tags"] = ansible_dict_to_boto3_tag_list(tags, "key", "value")
         try:
             response = self.ecs.start_task(**args)
-        except (
-            botocore.exceptions.ClientError,
-            botocore.exceptions.BotoCoreError,
-        ) as e:
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
             self.module.fail_json_aws(e, msg="Couldn't start task")
         # include tasks and failures
         return response["tasks"]
@@ -442,10 +388,41 @@ class EcsExecManager:
         return response["task"]
 
     def ecs_task_long_format_enabled(self):
-        account_support = self.ecs.list_account_settings(
-            name="taskLongArnFormat", effectiveSettings=True
-        )
+        account_support = self.ecs.list_account_settings(name="taskLongArnFormat", effectiveSettings=True)
         return account_support["settings"][0]["value"] == "enabled"
+
+    def wait_for_task_completion(self, cluster, task_arns):
+        """
+        Wait for tasks to complete and return detailed information.
+
+        Args:
+            cluster: The cluster name
+            task_arns: List of task ARNs to wait for
+
+        Returns:
+            List of task details including AWS's native stopCode, stoppedReason,
+            and container exitCode fields
+        """
+        # Wait for tasks to stop
+        waiter = self.ecs.get_waiter("tasks_stopped")
+        try:
+            waiter.wait(
+                tasks=task_arns,
+                cluster=cluster,
+            )
+        except botocore.exceptions.WaiterError as e:
+            self.module.fail_json_aws(e, "Timeout waiting for tasks to complete")
+
+        # Describe tasks to get complete details including exit codes
+        try:
+            response = self.ecs.describe_tasks(
+                cluster=cluster,
+                tasks=task_arns,
+            )
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
+            self.module.fail_json_aws(e, "Failed to describe completed tasks")
+
+        return response["tasks"]
 
 
 def main():
@@ -460,18 +437,9 @@ def main():
         started_by=dict(required=False, type="str"),  # R S
         network_configuration=dict(required=False, type="dict"),
         launch_type=dict(required=False, choices=["EC2", "FARGATE"]),
-        capacity_provider_strategy=dict(
-            required=False,
-            type="list",
-            elements="dict",
-            options=dict(
-                capacity_provider=dict(required=True, type="str"),
-                weight=dict(required=False, type="int"),
-                base=dict(required=False, type="int"),
-            ),
-        ),
         tags=dict(required=False, type="dict", aliases=["resource_tags"]),
         wait=dict(required=False, default=False, type="bool"),
+        wait_complete=dict(required=False, default=False, type="bool"),
     )
 
     module = AnsibleAWSModule(
@@ -482,9 +450,6 @@ def main():
             ("operation", "run", ["task_definition"]),
             ("operation", "start", ["task_definition", "container_instances"]),
             ("operation", "stop", ["task_definition", "task"]),
-        ],
-        mutually_exclusive=[
-            ("launch_type", "capacity_provider_strategy"),
         ],
     )
 
@@ -505,13 +470,9 @@ def main():
 
     if module.params["tags"]:
         if not service_mgr.ecs_task_long_format_enabled():
-            module.fail_json(
-                msg="Cannot set task tags: long format task arns are required to set tags"
-            )
+            module.fail_json(msg="Cannot set task tags: long format task arns are required to set tags")
 
-    existing = service_mgr.list_tasks(
-        module.params["cluster"], task_to_list, status_type
-    )
+    existing = service_mgr.list_tasks(module.params["cluster"], task_to_list, status_type)
 
     results = dict(changed=False)
     if module.params["operation"] == "run":
@@ -529,11 +490,10 @@ def main():
                     module.params["started_by"],
                     module.params["launch_type"],
                     module.params["tags"],
-                    module.params["capacity_provider_strategy"],
                 )
 
                 # Wait for task(s) to be running prior to exiting
-                if module.params["wait"]:
+                if module.params["wait"] or module.params["wait_complete"]:
                     waiter = service_mgr.ecs.get_waiter("tasks_running")
                     try:
                         waiter.wait(
@@ -542,6 +502,13 @@ def main():
                         )
                     except botocore.exceptions.WaiterError as e:
                         module.fail_json_aws(e, "Timeout waiting for tasks to run")
+
+                # Wait for task(s) to complete and capture exit codes
+                if module.params["wait_complete"]:
+                    tasks = service_mgr.wait_for_task_completion(
+                        module.params["cluster"],
+                        [task["taskArn"] for task in tasks],
+                    )
 
                 results["task"] = tasks
 
@@ -553,7 +520,7 @@ def main():
             results["task"] = existing
         else:
             if not module.check_mode:
-                results["task"] = service_mgr.start_task(
+                tasks = service_mgr.start_task(
                     module.params["cluster"],
                     module.params["task_definition"],
                     module.params["overrides"],
@@ -561,6 +528,26 @@ def main():
                     module.params["started_by"],
                     module.params["tags"],
                 )
+
+                # Wait for task(s) to complete and capture exit codes
+                if module.params["wait_complete"]:
+                    # First wait for tasks to be running
+                    waiter = service_mgr.ecs.get_waiter("tasks_running")
+                    try:
+                        waiter.wait(
+                            tasks=[task["taskArn"] for task in tasks],
+                            cluster=module.params["cluster"],
+                        )
+                    except botocore.exceptions.WaiterError as e:
+                        module.fail_json_aws(e, "Timeout waiting for tasks to run")
+
+                    # Then wait for completion
+                    tasks = service_mgr.wait_for_task_completion(
+                        module.params["cluster"],
+                        [task["taskArn"] for task in tasks],
+                    )
+
+                results["task"] = tasks
 
             results["changed"] = True
 
@@ -571,9 +558,7 @@ def main():
             if not module.check_mode:
                 # it exists, so we should delete it and mark changed.
                 # return info about the cluster deleted
-                results["task"] = service_mgr.stop_task(
-                    module.params["cluster"], module.params["task"]
-                )
+                results["task"] = service_mgr.stop_task(module.params["cluster"], module.params["task"])
 
                 # Wait for task to be stopped prior to exiting
                 if module.params["wait"]:
