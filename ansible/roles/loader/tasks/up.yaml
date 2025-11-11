@@ -3,16 +3,27 @@
   amazon.aws.aws_caller_info:
   register: aws_caller_info_r
 
+#  See documentation at https://docs.aws.amazon.com/AmazonECS/latest/developerguide/infrastructure_IAM_role.html
 - name: Create IAM role for ECS Task execution
   amazon.aws.iam_role:
     name: "{{ prefix_v }}-ecs-task-role"
     description: "Ansible install of ECS Tasks to run for data load"
-    assume_role_policy_document: "{{  lookup('template', 'role_policy.json.j2') }}"
+    assume_role_policy_document: |
+      {
+        "Version":"2012-10-17",
+        "Statement": [ 
+          {
+            "Sid": "AllowAccessToECSForInfrastructureManagement", 
+            "Effect": "Allow", 
+            "Principal": {
+              "Service": "ecs.amazonaws.com" 
+            }, 
+            "Action": "sts:AssumeRole" 
+          } 
+        ] 
+      }
     managed_policies:
-      - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForVolumes
-      - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForServiceConnectTransportLayerSecurity
       - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForManagedInstances
-
   register: iam_role_r
 
 - name: Create instance profile for ECS Task scaling
@@ -42,7 +53,8 @@
   community.aws.ecs_taskdefinition:
     family: "{{ prefix_v }}-download-wiki-and-grid"
     state: "present"
-    launch_type: FARGATE
+    # launch_type: FARGATE  # Commented out - using managed instances capacity provider instead
+    launch_type: EC2
     memory: 512
     cpu: 256
     network_mode: awsvpc
@@ -53,7 +65,7 @@
           - sourceVolume: data
             containerPath: '/data'
             readOnly: false
-    volumes: 
+    volumes:
       - name: data
         efsVolumeConfiguration:
           fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
@@ -62,7 +74,8 @@
   community.aws.ecs_taskdefinition:
     family: "{{ prefix_v }}-download-osm"
     state: "present"
-    launch_type: FARGATE
+    # launch_type: FARGATE  # Commented out - using managed instances capacity provider instead
+    launch_type: EC2
     memory: 512
     cpu: 256
     network_mode: awsvpc
@@ -76,7 +89,7 @@
         command:
           - download-owm
           - "{{ osm_region_v }}"
-    volumes: 
+    volumes:
       - name: data
         efsVolumeConfiguration:
           fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
@@ -86,58 +99,65 @@
     name: "{{ prefix_v }}-ecs-cluster"
     state: "present"
     capacity_providers:
-      - FARGATE
-      - FARGATE_SPOT
+      # - FARGATE  # Commented out - using managed instances capacity provider instead
+      # - FARGATE_SPOT
+      - "{{ prefix_v }}-ecs-capacity-provider"
     capacity_provider_strategy:
-      - capacity_provider: FARGATE
+      # - capacity_provider: FARGATE
+      #   base: 1
+      #   weight: 1
+      # - capacity_provider: FARGATE_SPOT
+      #   weight: 100
+      - capacity_provider: "{{ prefix_v }}-ecs-capacity-provider"
         base: 1
         weight: 1
-      - capacity_provider: FARGATE_SPOT
-        weight: 100
     purge_capacity_providers: true
-
-- name: Fill in managed instances provider details
-  ansible.builtin.template:
-    src: ../templates/managed_instances_provider.yaml.j2
-    dest: /tmp/managed_instances_provider.yaml
 
 - name: Allocate an ECS capacity provider
   ecs_capacityprovider:
     name: "{{ prefix_v }}-ecs-capacity-provider"
     cluster: "{{ prefix_v }}-ecs-cluster"
     state: "present"
-    managed_instances_provider: 
+    managed_instances_provider:
       infrastructure_role_arn: "{{ iam_role_r.iam_role.arn }}"
       instance_launch_template:
         ec2_instance_profile_arn: "{{ iam_instance_profile_r.iam_instance_profile.arn }}"
         network_configuration:
           subnets: "{{ subnets_v }}"
-          security_groups: :1
+          security_groups:
             - "{{ security_group_v }}"
         instance_requirements:
           vcpu_count: { min: 2 }
           memory_mib: { min: 4096 }
+    wait: true
+    wait_timeout: 320
 
 - name: Load the grid and wiki data
-  community.aws.ecs_task:
+  ecs_task:
     operation: run
     count: 1
     started_by: Ansible automation
     cluster: "{{ prefix_v }}-ecs-cluster"
     task_definition: "{{ prefix_v }}-download-wiki-and-grid"
-    launch_type: FARGATE
+    capacity_provider_strategy:
+      - capacity_provider: "{{ prefix_v }}-ecs-capacity-provider"
+        weight: 1
+        base: 0
     network_configuration:
       assign_public_ip: false
       subnets: "{{ subnets_v }}"
 
 - name: Download the map data for selected region
-  community.aws.ecs_task:
+  ecs_task:
     operation: run
     count: 1
     started_by: Ansible automation
     cluster: "{{ prefix_v }}-ecs-cluster"
     task_definition: "{{ prefix_v }}-download-osm"
-    launch_type: FARGATE
+    capacity_provider_strategy:
+      - capacity_provider: "{{ prefix_v }}-ecs-capacity-provider"
+        weight: 1
+        base: 0
     network_configuration:
       assign_public_ip: false
       subnets: "{{ subnets_v }}"

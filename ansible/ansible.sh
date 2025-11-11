@@ -8,7 +8,7 @@ usage() {
   echo "  down - Bring the role down"
 }
 
-declare verbosity
+declare verbosity=
 if [[ "$1" =~ ^-vv*$ ]]; then
   verbosity="$1"
   shift
@@ -34,10 +34,19 @@ if [ -z "$role" ]; then
   exit 16
 fi
 
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+  (
+    cd $SCRIPT_DIR
+    uv venv --seed
+    source .venv/bin/activate
+    pip install -r requirements.txt
+  )
+fi
+
 # Ansible needs this to work with modern macos (for now)
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-export ANSIBLE_PYTHON_INTERPRETER="$SCRIPT_DIR/../.venv/bin/python"
+export ANSIBLE_PYTHON_INTERPRETER="$SCRIPT_DIR/.venv/bin/python"
 
 (
   ansible $verbosity -i inventory.ini \
