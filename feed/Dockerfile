@@ -26,8 +26,8 @@ ENV PGHOST=gis \
     PGPASSWORD=change-this-password \
     OSM_FILENAME=
 
-RUN groupadd -g 1001 nominatim \
- && useradd -u 1001 -g 1001 -ms /bin/bash -d /nominatim nominatim
+RUN groupadd -g 1000 nominatim \
+ && useradd -u 1000 -g 1000 -ms /bin/bash -d /nominatim nominatim
 
 USER nominatim
 WORKDIR /nominatim

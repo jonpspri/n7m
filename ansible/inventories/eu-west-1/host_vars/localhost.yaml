@@ -1,0 +1,10 @@
+prefix_v: n7m-eu-west-1-dev
+region_v: eu-west-1
+
+keypair_v: jps
+bastion_ami_v: ami-068257194ae9d7ebf   # arm64 Ubuntu LTS
+owner_v: Jonathan Springer
+
+# osm_continent_v: europe
+# osm_region_v: monaco
+

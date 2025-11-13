@@ -1,0 +1,2 @@
+[ungrouped]
+localhost ansible_connection=local ansible_python_interpreter=/Users/jonpspri/Projects/n7m/ansible/.venv/bin/python

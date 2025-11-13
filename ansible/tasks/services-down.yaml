@@ -1,0 +1,15 @@
+---
+#
+#  Note that we do NOT deallocate the task definitions because they're versioned in Amazon,
+#  and there's no charge for their definition.
+#
+
+# Delete the feed service
+- name: Delete database feed service
+  community.aws.ecs_service:
+    state: absent
+    name: "{{ prefix_v }}-n7m-feed"
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    force_deletion: true
+    wait: true
+  register: feed_service_delete_result

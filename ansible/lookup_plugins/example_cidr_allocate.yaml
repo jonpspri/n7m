@@ -1,0 +1,104 @@
+---
+# Example playbook demonstrating the cidr_allocate lookup plugin
+#
+# NOTE: For this lookup plugin to work in Ansible, you may need to move it to:
+#   - lookup_plugins/cidr_allocate.py (in your playbook directory)
+#   OR
+#   - ~/.ansible/plugins/lookup/cidr_allocate.py (in your home directory)
+#   OR
+#   - Set ANSIBLE_LOOKUP_PLUGINS environment variable to point to the library directory
+#
+# For testing, you can run:
+#   export ANSIBLE_LOOKUP_PLUGINS=./library
+#   ansible-playbook example_cidr_allocate.yaml
+
+- name: CIDR Allocation Examples
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Master CIDR range for the organization
+    master_cidr: "172.16.0.0/12"
+
+    # List of already-allocated CIDR blocks
+    existing_vpcs:
+      - "172.16.0.0/16"   # Production VPC
+      - "172.17.0.0/16"   # Staging VPC
+      - "172.18.5.0/24"   # Special purpose network
+
+  tasks:
+    - name: Example 1 - Allocate a /16 VPC CIDR with no existing allocations
+      debug:
+        msg: "Allocated VPC CIDR: {{ lookup('cidr_allocate', master_cidr='10.0.0.0/8', prefix_length=16, used_cidrs=[]) }}"
+
+    - name: Example 2 - Allocate a /16 VPC avoiding existing allocations
+      set_fact:
+        new_vpc_cidr: "{{ lookup('cidr_allocate',
+                          master_cidr=master_cidr,
+                          prefix_length=16,
+                          used_cidrs=existing_vpcs) }}"
+
+    - name: Display allocated VPC CIDR
+      debug:
+        msg: "New VPC CIDR (best-fit): {{ new_vpc_cidr }}"
+
+    - name: Example 3 - Allocate a /24 subnet
+      set_fact:
+        new_subnet_cidr: "{{ lookup('cidr_allocate',
+                             master_cidr=master_cidr,
+                             prefix_length=24,
+                             used_cidrs=existing_vpcs) }}"
+
+    - name: Display allocated subnet CIDR
+      debug:
+        msg: "New subnet CIDR: {{ new_subnet_cidr }}"
+
+    - name: Example 4 - Allocate multiple subnets (using loop)
+      set_fact:
+        allocated_subnets: "{{ allocated_subnets | default([]) + [lookup('cidr_allocate',
+                              master_cidr=master_cidr,
+                              prefix_length=24,
+                              used_cidrs=(existing_vpcs + allocated_subnets | default([])))] }}"
+      loop: "{{ range(0, 3) | list }}"
+      loop_control:
+        label: "Allocating subnet {{ item + 1 }}"
+
+    - name: Display all allocated subnets
+      debug:
+        msg: "Allocated subnets: {{ allocated_subnets }}"
+
+    - name: Example 5 - Real-world scenario with dynamic VPC creation
+      block:
+        - name: Get list of existing VPC CIDRs (simulated)
+          set_fact:
+            current_vpc_cidrs:
+              - "172.16.0.0/16"
+              - "172.17.0.0/16"
+
+        - name: Allocate CIDR for new development VPC
+          set_fact:
+            dev_vpc_cidr: "{{ lookup('cidr_allocate',
+                              master_cidr='172.16.0.0/12',
+                              prefix_length=16,
+                              used_cidrs=current_vpc_cidrs) }}"
+
+        - name: Display development VPC details
+          debug:
+            msg: |
+              Development VPC Configuration:
+                CIDR: {{ dev_vpc_cidr }}
+                Available IPs: {{ 2 ** (32 - 16) - 2 }}
+                Network: {{ dev_vpc_cidr | ansible.utils.ipaddr('network') }}
+                Broadcast: {{ dev_vpc_cidr | ansible.utils.ipaddr('broadcast') }}
+
+    - name: Example 6 - Error handling
+      block:
+        - name: Try to allocate from full address space (will fail)
+          debug:
+            msg: "{{ lookup('cidr_allocate',
+                    master_cidr='192.168.1.0/24',
+                    prefix_length=24,
+                    used_cidrs=['192.168.1.0/24']) }}"
+      rescue:
+        - name: Handle allocation failure
+          debug:
+            msg: "Failed to allocate CIDR - address space is full"

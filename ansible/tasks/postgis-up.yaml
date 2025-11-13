@@ -1,0 +1,142 @@
+---
+- name: Create a password for the database (if it does not exist)
+  community.aws.secretsmanager_secret:
+    name: '{{ prefix_v }}-postgis-{{ item }}-password'
+    state: present
+    secret_type: string
+    secret: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_letters','digits'], length=32) }}"
+    overwrite: false
+  loop:
+    - master-user
+    - gis-admin
+
+- name: Create RDS Cluster
+  amazon.aws.rds_cluster:
+    state: present
+    cluster_id: "{{ prefix_v }}-n7m-postgis"
+    database_name: "n7m"
+    engine: aurora-postgresql
+    engine_mode: provisioned
+    master_username: postgres
+    master_user_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+  register: postgis_db_cluster_r
+
+- name: Add an instance to the cluster
+  amazon.aws.rds_instance:
+    state: present
+    id: "{{ prefix_v }}-n7m-postgis-1"
+    cluster_id: "{{ prefix_v }}-n7m-postgis"
+    engine: aurora-postgresql
+    db_instance_class: db.t4g.medium
+    publicly_accessible: true
+
+- name: Create gis_admin role (user)
+  community.postgresql.postgresql_user:
+    state: present
+    user: gis_admin
+    password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+
+- name: Grant rds_superuser to gis_admin
+  community.postgresql.postgresql_privs:
+    state: present
+    type: group
+    objs: rds_superuser
+    roles: gis_admin
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: postgres
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+
+- name: Create a gis_lab database to use as a template
+  community.postgresql.postgresql_db:
+    state: present
+    name: lab_gis
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+   
+- name: Grant all privileges on lab_gis to gis_admin
+  community.postgresql.postgresql_privs:
+    state: present
+    privs: all
+    type: database
+    objs: lab_gis
+    roles: gis_admin
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: postgres
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+    
+- name: Install postgis database
+  community.postgresql.postgresql_ext:
+    state: present
+    name: "{{ item }}"
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: lab_gis
+    login_user: gis_admin
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+  loop:
+    - postgis
+    - postgis_topology
+    - fuzzystrmatch
+    - postgis_tiger_geocoder
+
+- name: Alter schema owners to gis_admin
+  community.postgresql.postgresql_schema:
+    state: present
+    name: "{{ item }}"
+    owner: gis_admin
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: lab_gis
+    login_user: gis_admin
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+  loop:
+    - tiger
+    - tiger_data
+    - topology
+
+- name: Get list of tables to transfer to gis_admin
+  community.postgresql.postgresql_query:
+    query: |
+          SELECT nspname, relname, relkind
+            FROM pg_class c JOIN pg_namespace n ON (c.relnamespace = n.oid) 
+            WHERE nspname in ('tiger','topology') 
+              AND relkind IN ('r','S','v') 
+            ORDER BY relkind = 'S'
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: lab_gis
+    login_user: gis_admin
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+  register: postgresql_query_r
+
+- name: Change ownership of selected tables
+  community.postgresql.postgresql_table:
+    state: present
+    name: "{{ item.nspname + '.' + item.relname }}"
+    owner: gis_admin
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: lab_gis
+    login_user: gis_admin
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+  loop: "{{ postgresql_query_r.query_result | selectattr('relkind', '==', 'r') }}"
+
+- name: Change ownership of selected sequences
+  community.postgresql.postgresql_sequence:
+    state: present
+    schema: "{{ item.nspname }}"
+    name: "{{ item.relname }}"
+    owner: gis_admin
+    login_host: "{{ postgis_db_cluster_r.endpoint }}"
+    login_port: "{{ postgis_db_cluster_r.port }}"
+    login_db: lab_gis
+    login_user: gis_admin
+    login_password: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+  loop: "{{ postgresql_query_r.query_result | selectattr('relkind', '==', 'S') }}"
+

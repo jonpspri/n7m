@@ -1,0 +1,101 @@
+---
+- name: ECS Task for n7m-feed
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-n7m-feed"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+    containers:
+      - name: n7m-feed
+        image: ghcr.io/jonpspri/n7m-feed
+        mountPoints:
+          - sourceVolume: data
+            containerPath: /data
+            readOnly: false
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+        environment:
+          - name: PGHOST
+            value: "{{ postgis_db_cluster_r.endpoint }}"
+          - name: PGPASSWORD
+            value: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+          - name: OSM_FILENAME
+            value: "{{ osm_region_v }}-latest.pbf"
+          - name: NOMINATIM_REPLICATION_URL
+            value: "https://download.geofabrik.de/{{ osm_continent_v }}/{{ osm_region_v }}-updates"
+          - name: NOMINATIM_REPLICATION_MAX_DIFF
+            value: "3000"
+          - name: NOMINATIM_REPLICATION_UPDATE_INTERVAL
+            value: "86400"
+    volumes:
+      - name: data
+        efsVolumeConfiguration:
+          fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
+  register: n7m_feed_td_r
+
+- name: ECS Task Defintion for n7m-api
+  community.aws.ecs_taskdefinition:
+    family: "{{ prefix_v }}-n7m-api"
+    state: "present"
+    launch_type: FARGATE
+    memory: 512
+    cpu: 256
+    network_mode: awsvpc
+    execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+    containers:
+      - name: n7m-api
+        image: ghcr.io/jonpspri/n7m-api
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+        environment:
+          - name: PGHOST
+            value: "{{ postgis_db_cluster_r.endpoint }}"
+          - name: PGPASSWORD
+            value: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-gis-admin-password') }}"
+          - name: WEB-CONCURRENCY
+            value: "2"
+      - name: n7m-ui
+        image: ghcr.io/jonpspri/n7m-ui
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+      - name: n7m-web
+        image: ghcr.io/jonpspri/n7m-web
+        logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: /ecs/n7m
+            awslogs-region: "{{ region_v }}"
+            awslogs-stream-prefix: ecs
+  register: n7m_web_td_r
+
+- name: Feed Task Definition
+  ansible.builtin.debug:
+    var: n7m_feed_td_r
+    verbosity: 2
+
+- name: Database feed service
+  community.aws.ecs_service:
+    state: present
+    name: "{{ prefix_v }}-n7m-feed"
+    cluster: "{{ prefix_v }}-ecs-cluster"
+    desired_count: 1
+    task_definition: "{{ n7m_feed_td_r.taskdefinition.taskDefinitionArn }}"
+    network_configuration:
+      assign_public_ip: true
+      subnets: "{{ subnets_v }}"
+  

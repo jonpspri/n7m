@@ -9,6 +9,7 @@ jmespath==1.0.1
 markupsafe==3.0.3
 packaging==25.0
 pip==25.3
+psycopg2==2.9.11
 pycparser==2.23
 python-dateutil==2.9.0.post0
 pyyaml==6.0.3

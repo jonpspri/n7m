@@ -1,0 +1,11 @@
+- hosts: "_bastion"
+  tasks:
+
+  - name: Deallocate /data EFS partition
+    community.aws.efs:
+      region: "{{ region_v }}"
+      state: "absent"
+      name: "{{ prefix_v }}-data"
+      access_key: "{{ access_key_v }}"
+      secret_key: "{{ secret_key_v }}"
+    register: efs_data_r

@@ -1,37 +1,4 @@
 ---
-- name: Create EFS targets list
-  ansible.builtin.set_fact:
-    efs_targets_f: >- 
-      {{ (efs_targets_f | default([]) ) + [ { 'subnet_id': item, 'security_groups': [ security_group_v ] } ] }}
-  loop: "{{ subnets_v }}"
-
-- name: Allocate /data efs partition
-  community.aws.efs:
-    state: "present"
-    name: "{{ prefix_v }}-data"
-    targets: "{{ efs_targets_f }}"
-  register: efs_data_r
-
-- name: Create an execution role for the containers
-  amazon.aws.iam_role:
-    name: "{{ prefix_v }}-container-execution-role"
-    assume_role_policy_document: |
-        {
-          "Version":"2012-10-17",
-          "Statement": [
-            {
-              "Sid": "",
-              "Effect": "Allow",
-              "Principal": {
-                "Service": "ecs-tasks.amazonaws.com"
-              },
-              "Action": "sts:AssumeRole"
-            }
-          ]
-        }
-    managed_policies:
-      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-  register: execution_role_r
 
 - name: Allocate osm download task_definition
   community.aws.ecs_taskdefinition:
@@ -79,12 +46,12 @@
           - /bin/bash
           - -x
           - -c
-          - >
+          - |
               rm -rf /data/{{ prefix_v }} || /bin/true
               mkdir /data/{{ prefix_v }} 
-              mv /data/*.osm.pbf /data/{{ prefix_v }}/
+              mv /data/{{ osm_region_v }}-*.osm.pbf /data/{{ prefix_v }}/{{ osm_region_v }}-latest.osm.pbf
               chown -R 1001:1001 /data/{{ prefix_v }}
-              rm /data/*.pbf
+              rm /data/*.pbf || /bin/true
         mountPoints:
           - sourceVolume: data
             containerPath: '/data'
@@ -132,21 +99,6 @@
           fileSystemId: "{{ efs_data_r.efs.file_system_id }}"
           rootDirectory: "/{{ prefix_v }}"
 
-- name: Allocate an ECS cluster for load execution
-  community.aws.ecs_cluster:
-    name: "{{ prefix_v }}-ecs-cluster"
-    state: "present"
-    capacity_providers:
-      - FARGATE 
-      - FARGATE_SPOT
-    capacity_provider_strategy:
-      - capacity_provider: FARGATE
-        base: 1
-        weight: 1
-      - capacity_provider: FARGATE_SPOT
-        weight: 100
-    purge_capacity_providers: true
-
 - name: Download the map data for selected region
   ecs_task:
     operation: run
@@ -160,6 +112,8 @@
       subnets: "{{ subnets_v }}"
     wait_complete: true
   register: osm_task_r
+  retries: 15  # It may take time for the IAM role to be aviable to ECS
+  delay: 20
 
 - name: Check OSM download result
   ansible.builtin.fail:
@@ -191,7 +145,7 @@
     configurator_task_r.task[0].stopCode != 'EssentialContainerExited' or
     configurator_task_r.task[0].containers[0].exitCode | default(1) != 0
 
-- name: Load the grid and wiki data
+- name: Download the grid and wiki data
   ecs_task:
     operation: run
     count: 1
@@ -205,7 +159,7 @@
     wait_complete: true
   register: grid_wiki_task_r
 
-- name: Check grid and wiki data load result
+- name: Check grid and wiki data download result
   ansible.builtin.fail:
     msg: "Grid/wiki download task failed: {{ grid_wiki_task_r.task[0].stoppedReason | default('Unknown reason') }}"
   when: >

@@ -1,8 +1,0 @@
-subnets_v: 
-  - subnet-09dbef5db54484c23
-  - subnet-0e120bf7dee01c5f4
-  - subnet-073817aa3bd8b392b
-security_group_v: sg-03a55b229ccb741dc
-prefix_v: n7m-eu-west-1-dev
-region_v: eu-west-1
-osm_region_v: monaco

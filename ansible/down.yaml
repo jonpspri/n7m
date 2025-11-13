@@ -1,0 +1,5 @@
+- hosts: all
+  vars:
+    state: absent
+- import_playbook: playbooks/efs-down.yaml
+- import_playbook: playbooks/vpc-down.yaml

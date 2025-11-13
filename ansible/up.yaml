@@ -1,0 +1,5 @@
+- hosts: all
+  vars:
+    state: present
+- import_playbook: playbooks/vpc-up.yaml
+- import_playbook: playbooks/efs-up.yaml

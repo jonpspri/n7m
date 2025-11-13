@@ -1,0 +1,42 @@
+---
+- name: Retreive cluster information (including instances)
+  amazon.aws.rds_cluster_info:
+    cluster_id: "{{ prefix_v }}-n7m-postgis"
+  register: n7m_postgis_cluster_info_r
+
+- name: Cluster information
+  ansible.builtin.debug:
+    var: n7m_postgis_cluster_info_r
+    verbosity: 2
+
+- name: Extract instances
+  ansible.builtin.set_fact:
+    instances_f: "{{ n7m_postgis_cluster_info_r | 
+        community.general.json_query('clusters[*].db_cluster_members[*].db_instance_identifier') | 
+        flatten }}"
+
+- name: Instances to Delete
+  ansible.builtin.debug:
+    var: instances_f
+    verbosity: 2
+
+- name: Delete the database instances
+  amazon.aws.rds_instance:
+    id: "{{ item }}"
+    state: absent
+    skip_final_snapshot: true
+  loop: "{{ instances_f }}"
+
+- name: Delete the cluster itself
+  amazon.aws.rds_cluster:
+    state: absent
+    cluster_id: "{{ prefix_v }}-n7m-postgis"
+    skip_final_snapshot: true
+
+- name: Delete the secrets
+  community.aws.secretsmanager_secret:
+    name: '{{ prefix_v }}-postgis-{{ item }}-password'
+    state: absent
+  loop: 
+    - master-user
+    - gis-admin
