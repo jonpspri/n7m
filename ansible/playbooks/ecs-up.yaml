@@ -1,0 +1,274 @@
+- hosts: "_bastion"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ access_key_v }}"
+    AWS_SECRET_ACCESS_KEY: "{{ secret_key_v }}"
+    AWS_REGION: "{{ region_v }}"
+  tasks:
+
+  - name: Get VPC private subnets
+    amazon.aws.ec2_vpc_subnet_info:
+      filters:
+        "tag:Project": "{{ prefix_v }}"
+        "map-public-ip-on-launch": false
+    register: vpc_private_subnet_f
+
+  - name: Get VPC public subnets
+    amazon.aws.ec2_vpc_subnet_info:
+      filters:
+        "tag:Project": "{{ prefix_v }}"
+        "map-public-ip-on-launch": true
+    register: vpc_public_subnet_f
+
+  - name: Get existing security groups for reference
+    amazon.aws.ec2_security_group_info:
+      filters:
+        "tag:Name": "{{ prefix_v }}-aurora-postgresql-sg"
+    register: aurora_sg_f
+
+  - name: Get EFS security group
+    amazon.aws.ec2_security_group_info:
+      filters:
+        "tag:Name": "{{ prefix_v }}-efs-sg"
+    register: efs_sg_f
+
+  - name: Get ALB security group
+    amazon.aws.ec2_security_group_info:
+      filters:
+        "tag:Name": "{{ prefix_v }}-alb-sg"
+    register: alb_sg_f
+
+  - name: Set ALB security group fact
+    ansible.builtin.set_fact:
+      alb_sg_r:
+        group_id: "{{ alb_sg_f.security_groups[0].group_id }}"
+
+  - name: Get ECS feed security group
+    amazon.aws.ec2_security_group_info:
+      filters:
+        "tag:Name": "{{ prefix_v }}-ecs-feed-sg"
+    register: ecs_feed_sg_f
+
+  - name: Set ECS feed security group fact
+    ansible.builtin.set_fact:
+      ecs_feed_sg_r:
+        group_id: "{{ ecs_feed_sg_f.security_groups[0].group_id }}"
+
+  - name: Get ECS web security group
+    amazon.aws.ec2_security_group_info:
+      filters:
+        "tag:Name": "{{ prefix_v }}-ecs-web-sg"
+    register: ecs_web_sg_f
+
+  - name: Set ECS web security group fact
+    ansible.builtin.set_fact:
+      ecs_web_sg_r:
+        group_id: "{{ ecs_web_sg_f.security_groups[0].group_id }}"
+
+  - name: Create an execution role for the containers
+    amazon.aws.iam_role:
+      name: "{{ prefix_v }}-container-execution-role"
+      assume_role_policy_document: |
+          {
+            "Version":"2012-10-17",
+            "Statement": [
+              {
+                "Sid": "",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+      managed_policies:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      wait: true
+    register: execution_role_r
+
+  - name: Allocate an ECS cluster for load execution
+    community.aws.ecs_cluster:
+      name: "{{ prefix_v }}-ecs-cluster"
+      state: "present"
+      capacity_providers:
+        - FARGATE
+        - FARGATE_SPOT
+      capacity_provider_strategy:
+        - capacity_provider: FARGATE
+          base: 1
+          weight: 1
+        - capacity_provider: FARGATE_SPOT
+          weight: 100
+      purge_capacity_providers: true
+
+  - name: Create target group for n7m-web service
+    community.aws.elb_target_group:
+      name: "{{ prefix_v }}-n7m-web-tg"
+      protocol: http
+      port: 80
+      vpc_id: "{{ vpc_private_subnet_f.subnets[0].vpc_id }}"
+      health_check_path: /
+      health_check_protocol: http
+      health_check_interval: 30
+      health_check_timeout: 5
+      healthy_threshold_count: 2
+      unhealthy_threshold_count: 2
+      target_type: ip
+      state: present
+    register: target_group_r
+
+  - name: Create Application Load Balancer
+    amazon.aws.elb_application_lb:
+      name: "{{ prefix_v }}-alb"
+      security_groups:
+        - "{{ alb_sg_r.group_id }}"
+      subnets: "{{ vpc_public_subnet_f.subnets | map(attribute='id') }}"
+      scheme: internet-facing
+      state: present
+      tags:
+        "Name": "{{ prefix_v }}-alb"
+        "Project": "{{ prefix_v }}"
+      listeners:
+        - Protocol: HTTP
+          Port: 80
+          DefaultActions:
+            - Type: forward
+              TargetGroupArn: "{{ target_group_r.target_group_arn }}"
+    register: alb_r
+
+  - name: Retreive information about the RDS cluster
+    amazon.aws.rds_cluster_info:
+        cluster_id: "{{ prefix_v }}-n7m-postgis"
+    register: rds_cluster_info_r
+
+  - name: Retreive infomration about the EFS file system
+    community.aws.efs_info:
+        name: "{{ prefix_v }}-data"
+    register: efs_info_r
+
+  - name: ECS Task for n7m-feed
+    community.aws.ecs_taskdefinition:
+      family: "{{ prefix_v }}-n7m-feed"
+      state: "present"
+      launch_type: FARGATE
+      memory: 512
+      cpu: 256
+      network_mode: awsvpc
+      execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+      containers:
+        - name: n7m-feed
+          image: ghcr.io/jonpspri/n7m-feed
+          mountPoints:
+            - sourceVolume: data
+              containerPath: /data
+              readOnly: false
+          logConfiguration:
+            logDriver: awslogs
+            options:
+              awslogs-group: /ecs/n7m
+              awslogs-region: "{{ region_v }}"
+              awslogs-stream-prefix: ecs
+          environment:
+            - name: PGHOST
+              value: "{{ rds_cluster_info_r.clusters[0].endpoint }}"
+            - name: PGUSER
+              value: postgres
+            - name: PGPASSWORD
+              value: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+            - name: OSM_FILENAME
+              value: "{{ osm_region_v }}-latest.pbf"
+            - name: NOMINATIM_REPLICATION_URL
+              value: "https://download.geofabrik.de/{{ osm_continent_v }}/{{ osm_region_v }}-updates"
+            - name: NOMINATIM_REPLICATION_MAX_DIFF
+              value: "3000"
+            - name: NOMINATIM_REPLICATION_UPDATE_INTERVAL
+              value: "86400"
+      volumes:
+        - name: data
+          efsVolumeConfiguration:
+            fileSystemId: "{{ efs_info_r.efs[0].file_system_id }}"
+            rootDirectory: /data
+    register: n7m_feed_td_r
+
+  - name: ECS Task Defintion for n7m-web interface
+    community.aws.ecs_taskdefinition:
+      family: "{{ prefix_v }}-n7m-api"
+      state: "present"
+      launch_type: FARGATE
+      memory: 512
+      cpu: 256
+      network_mode: awsvpc
+      execution_role_arn: "{{ execution_role_r.iam_role.arn }}"
+      containers:
+        - name: n7m-api
+          image: ghcr.io/jonpspri/n7m-api
+          logConfiguration:
+            logDriver: awslogs
+            options:
+              awslogs-group: /ecs/n7m
+              awslogs-region: "{{ region_v }}"
+              awslogs-stream-prefix: ecs
+          environment:
+            - name: PGHOST
+              value: "{{ rds_cluster_info_r.clusters[0].endpoint }}"
+            - name: PGUSER
+              value: postgres
+            - name: PGPASSWORD
+              value: "{{ lookup('amazon.aws.secretsmanager_secret', prefix_v + '-postgis-master-user-password') }}"
+            - name: WEB-CONCURRENCY
+              value: "2"
+        - name: n7m-ui
+          image: ghcr.io/jonpspri/n7m-ui
+          logConfiguration:
+            logDriver: awslogs
+            options:
+              awslogs-group: /ecs/n7m
+              awslogs-region: "{{ region_v }}"
+              awslogs-stream-prefix: ecs
+        - name: n7m-web
+          image: ghcr.io/jonpspri/n7m-web
+          portMappings:
+            - containerPort: 80
+              protocol: tcp
+          logConfiguration:
+            logDriver: awslogs
+            options:
+              awslogs-group: /ecs/n7m
+              awslogs-region: "{{ region_v }}"
+              awslogs-stream-prefix: ecs
+    register: n7m_web_td_r
+
+  - name: Feed Task Definition
+    ansible.builtin.debug:
+      var: n7m_feed_td_r
+      verbosity: 2
+
+  - name: Database feed service
+    community.aws.ecs_service:
+      state: present
+      name: "{{ prefix_v }}-n7m-feed"
+      cluster: "{{ prefix_v }}-ecs-cluster"
+      desired_count: 1
+      task_definition: "{{ n7m_feed_td_r.taskdefinition.taskDefinitionArn }}"
+      network_configuration:
+        assign_public_ip: false
+        subnets: "{{ vpc_private_subnet_f.subnets | map(attribute='id') }}"
+        security_groups:
+          - "{{ ecs_feed_sg_r.group_id }}"
+
+  - name: Web service (API, UI, and Web)
+    community.aws.ecs_service:
+      state: present
+      name: "{{ prefix_v }}-n7m-web"
+      cluster: "{{ prefix_v }}-ecs-cluster"
+      desired_count: 1
+      task_definition: "{{ n7m_web_td_r.taskdefinition.taskDefinitionArn }}"
+      load_balancers:
+        - targetGroupArn: "{{ target_group_r.target_group_arn }}"
+          containerName: n7m-web
+          containerPort: 80
+      network_configuration:
+        assign_public_ip: false
+        subnets: "{{ vpc_private_subnet_f.subnets | map(attribute='id') }}"
+        security_groups:
+          - "{{ ecs_web_sg_r.group_id }}"

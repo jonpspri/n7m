@@ -1,0 +1,63 @@
+- hosts: "_bastion"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ access_key_v }}"
+    AWS_SECRET_ACCESS_KEY: "{{ secret_key_v }}"
+    AWS_REGION: "{{ region_v }}"
+  tasks:
+
+  #
+  #  Note that we do NOT deallocate the task definitions because they're versioned in Amazon,
+  #  and there's no charge for their definition.
+  #
+
+  # Delete the services
+  - name: Delete database feed service
+    community.aws.ecs_service:
+      state: absent
+      name: "{{ prefix_v }}-n7m-feed"
+      cluster: "{{ prefix_v }}-ecs-cluster"
+      force_deletion: true
+      wait: true
+    register: feed_service_delete_result
+
+  - name: Delete web service
+    community.aws.ecs_service:
+      state: absent
+      name: "{{ prefix_v }}-n7m-web"
+      cluster: "{{ prefix_v }}-ecs-cluster"
+      force_deletion: true
+      wait: true
+    register: web_service_delete_result
+    ignore_errors: true
+
+  # Delete the ALB
+  - name: Delete Application Load Balancer
+    amazon.aws.elb_application_lb:
+      name: "{{ prefix_v }}-alb"
+      state: absent
+      wait: true
+    ignore_errors: true
+
+  # Delete the target group
+  - name: Delete target group
+    community.aws.elb_target_group:
+      name: "{{ prefix_v }}-n7m-web-tg"
+      state: absent
+    ignore_errors: true
+
+  # Delete the ECS cluster
+  - name: Deallocate ECS cluster
+    community.aws.ecs_cluster:
+      name: "{{ prefix_v }}-ecs-cluster"
+      state: absent
+    register: cluster_delete_result
+    retries: 5
+    delay: 10
+    until: cluster_delete_result is succeeded
+
+  # Clean up IAM execution role (no charge, but good practice)
+  - name: Delete IAM execution role
+    amazon.aws.iam_role:
+      name: "{{ prefix_v }}-container-execution-role"
+      state: absent
+

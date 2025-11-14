@@ -1,0 +1,86 @@
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+    # RETRIEVE VPC INFORMATION
+    - name: Get VPC info by name
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ region_v }}"
+        filters:
+          "tag:Name": "{{ prefix_v }}-vpc"
+      register: vpc_info
+
+    - name: Fail if VPC not found
+      ansible.builtin.fail:
+        msg: "VPC with name '{{ prefix_v }}-vpc' not found in region {{ region_v }}"
+      when: vpc_info.vpcs | length == 0
+
+    - name: Set VPC ID fact
+      ansible.builtin.set_fact:
+        vpc_id: "{{ vpc_info.vpcs[0].id }}"
+
+    # Delete security groups in reverse order of dependencies
+    # ALB SG first (no dependents)
+    - name: Delete ALB security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-alb-sg"
+        state: absent
+      ignore_errors: yes
+
+    # EFS SG (referenced by bastion and ecs-feed)
+    - name: Delete EFS security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-efs-sg"
+        state: absent
+      ignore_errors: yes
+
+    # Aurora SG (referenced by bastion, ecs-feed, and ecs-web)
+    - name: Delete Aurora PostgreSQL security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-aurora-postgresql-sg"
+        state: absent
+      ignore_errors: yes
+
+    # ECS Web SG
+    - name: Delete ECS web security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-ecs-web-sg"
+        state: absent
+      ignore_errors: yes
+
+    # ECS Feed SG
+    - name: Delete ECS feed security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-ecs-feed-sg"
+        state: absent
+      ignore_errors: yes
+
+    # Bastion SG (referenced by aurora and efs)
+    - name: Delete Bastion security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-bastion-sg"
+        state: absent
+      ignore_errors: yes
+
+    # Catch any remaining security groups that might have been missed
+    - name: Get remaining security groups for VPC
+      amazon.aws.ec2_security_group_info:
+        region: "{{ region_v }}"
+        filters:
+          vpc-id: "{{ vpc_id }}"
+      register: sg_info
+
+    - name: Delete any remaining security groups
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        group_id: "{{ item.group_id }}"
+        state: absent
+      loop: "{{ sg_info.security_groups }}"
+      when: item.group_name != 'default'
+      ignore_errors: yes

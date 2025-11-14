@@ -1,5 +1,9 @@
 - hosts: all
   vars:
     state: absent
+- import_playbook: playbooks/ecs-down.yaml
+- import_playbook: playbooks/postgis-down.yaml
 - import_playbook: playbooks/efs-down.yaml
+- import_playbook: playbooks/bastion-down.yaml
+- import_playbook: playbooks/security-down.yaml
 - import_playbook: playbooks/vpc-down.yaml

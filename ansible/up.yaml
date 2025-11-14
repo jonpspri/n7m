@@ -2,4 +2,8 @@
   vars:
     state: present
 - import_playbook: playbooks/vpc-up.yaml
+- import_playbook: playbooks/security-up.yaml
+- import_playbook: playbooks/bastion-up.yaml
 - import_playbook: playbooks/efs-up.yaml
+- import_playbook: playbooks/postgis-up.yaml
+- import_playbook: playbooks/ecs-up.yaml

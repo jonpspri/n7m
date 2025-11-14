@@ -2,6 +2,9 @@
   connection: local
   gather_facts: False
   tasks:
+    # - name: Import VPC Variables
+    #   include_vars: vars/vpc_setup
+    
     # Retrieve all extant AWS VPC CIDR ranges in the region
     - name: Retrieve allocated VPC ranges
       amazon.aws.ec2_vpc_net_info:
@@ -17,7 +20,7 @@
       vars:
         query_l: "vpcs[?tags.Name=='{{ prefix_v }}-vpc']"
 
-    - name: Select a CIDR for the VPC
+    - name: Select a CIDR for the VPC 
       when: vpc_exists_f | length == 0
       cidr_allocate:
         master_cidr: "172.16.0.0/12"
@@ -45,7 +48,7 @@
         count: "{{ azs_r.availability_zones | length }}"
       register: vpc_public_subnet_cidrs_r
 
-    - name: Select CIDRs for the private subnets
+    - name: Select CIDRs for the public subnets
       cidr_allocate:
         master_cidr: "{{ vpc_cidr_f }}"
         used_cidrs: "{{ vpc_public_subnet_cidrs_r.allocated_cidrs }}"
@@ -54,7 +57,7 @@
       register: vpc_private_subnet_cidrs_r
 
     # VPC
-    - name: Create VPC
+    - name: Create vprofile VPC
       amazon.aws.ec2_vpc_net:
         name: "{{ prefix_v }}-vpc"
         cidr_block: "{{ vpc_cidr_f }}"
@@ -68,10 +71,10 @@
       register: vpc_out
 
     # Subnets are identified by VPC and CIDR.  The "good news" is that as long as
-    # the CIDR selection algorithms are deterministic, we SHOULD get the same
-    # combinations each time.  I'm going to add sort filters in the loops to
-    # avoid any non-deterministic sort result problems.
-
+    # the CIDR selection algorithms are deterministic, we SHOULD get the same 
+    # combinations each time.  I'm going to add sort filters in the lops to 
+    # avoid any non-determinstic sort result problems.
+        
     # PUBLIC SUBNETS
     - name: create Public Subnets
       amazon.aws.ec2_vpc_subnet:
@@ -146,3 +149,94 @@
           - dest: 0.0.0.0/0
             gateway_id: "{{ NATGW_out.nat_gateway_id }}"
       register: privRT_out
+
+    # CREATE SECURITY GROUP
+    - name: Find my public ip
+      uri: 
+        url: http://ifconfig.me/ip
+        return_content: yes
+      register: ip_response
+
+    - name: Create Sec Grp for bastion host
+      amazon.aws.ec2_security_group:
+        name: "{{ prefix_v }}-bastion-sg"
+        description: Allow port 22 from everywhere and all port within sg
+        region: "{{ region_v }}"
+        vpc_id: "{{ vpc_out.vpc.id }}"
+        tags:
+          "Name": "{{ prefix_v }}-bastion-sg"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ ip_response.content }}/32"
+      register: bastion_sq_r
+
+    - name: Create Security Group for ECS feed tasks
+      amazon.aws.ec2_security_group:
+        name: "{{ prefix_v }}-ecs-feed-sg"
+        description: Allow ECS feed tasks to access PostgreSQL, EFS, and internet
+        region: "{{ region_v }}"
+        vpc_id: "{{ vpc_out.vpc.id }}"
+        tags:
+          "Name": "{{ prefix_v }}-ecs-feed-sg"
+        rules:
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+      register: ecs_feed_sg_r
+
+    - name: Create Security Group for ECS web tasks
+      amazon.aws.ec2_security_group:
+        name: "{{ prefix_v }}-ecs-web-sg"
+        description: Allow ECS web tasks to access PostgreSQL and internet
+        region: "{{ region_v }}"
+        vpc_id: "{{ vpc_out.vpc.id }}"
+        tags:
+          "Name": "{{ prefix_v }}-ecs-web-sg"
+        rules:
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+      register: ecs_web_sg_r
+
+    # CREATE BASTION INSTANCE
+    - name: Creating Bastion Host
+      amazon.aws.ec2_instance:
+        state: running
+        key_name: "{{ keypair_v }}"
+        region: "{{ region_v }}"
+        instance_type: "{{ instance_type_v }}"
+        image: 
+          id: "{{ bastion_ami_v }}"
+        wait: yes
+        wait_timeout: 300
+        tags:
+          Name: "{{ prefix_v }}-bastion"
+          Project: "{{ prefix_v }}"
+          Owner: "{{ owner_v }}"
+          Role: "bastion"
+        exact_count: 1
+        filters:
+          "tag:Name": "{{ prefix_v }}-bastion"
+          "instance-state-name": "running"
+        network_interfaces:
+          - assign_public_ip: true
+            groups: 
+              - "{{bastion_sq_r.group_id}}"
+            subnet_id: "{{ public_subnets_r.results[0].subnet.id }}"
+      register: bastionHost_out
+
+    - name: Refresh inventory
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Wait for SSH to become available on bastion
+      ansible.builtin.wait_for:
+        host: "{{ bastionHost_out.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+      connection: local

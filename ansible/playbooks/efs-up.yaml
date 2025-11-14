@@ -1,39 +1,118 @@
 - hosts: "_bastion"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ access_key_v }}"
+    AWS_SECRET_ACCESS_KEY: "{{ secret_key_v }}"
+    AWS_REGION: "{{ region_v }}"
   tasks:
+
+  - name: Update all packages to their latest version
+    ansible.builtin.apt:
+      name: "*"
+      state: latest
+      update_cache: true
+    become: true
+
+  - name: Add the NFS essentials
+    ansible.builtin.apt:
+        name: nfs-common
+        state: present
+    become: true
 
   - name: Get VPC subnets
     amazon.aws.ec2_vpc_subnet_info:
-      region: "{{ region_v }}"
       filters:
         "tag:Project": "{{ prefix_v }}"
         "map-public-ip-on-launch": false
-      access_key: "{{ access_key_v }}"
-      secret_key: "{{ secret_key_v }}"
     register: vpc_private_subnet_f
 
-  - name: Get Bastion Security Group
+  - name: Get EFS Security Group
     amazon.aws.ec2_security_group_info:
-      region: "{{ region_v }}"
       filters:
-          "tag:Name": "{{ prefix_v }}-bastion-sg"
-      access_key: "{{ access_key_v }}"
-      secret_key: "{{ secret_key_v }}"
-    register: vpc_sg_f
+          "tag:Name": "{{ prefix_v }}-efs-sg"
+    register: efs_sg_f
+
+  - name: Set EFS security group fact
+    ansible.builtin.set_fact:
+      efs_sg_r:
+        group_id: "{{ efs_sg_f.security_groups[0].group_id }}"
 
   - name: Create EFS targets list
     ansible.builtin.set_fact:
       efs_targets_f: "{{ (efs_targets_f | default([]) ) + 
-        [ { 'subnet_id': item, 'security_groups': [ vpc_sg_f.security_groups[0].group_id ] } ] 
+        [ { 'subnet_id': item, 'security_groups': [ efs_sg_r.group_id ] } ]
         }}"
     loop: "{{ vpc_private_subnet_f.subnets | map(attribute='id') }}"
 
   - name: Allocate /data EFS partition
     community.aws.efs:
-      region: "{{ region_v }}"
       state: "present"
       name: "{{ prefix_v }}-data"
       targets: "{{ efs_targets_f }}"
-      access_key: "{{ access_key_v }}"
-      secret_key: "{{ secret_key_v }}"
     register: efs_data_r
 
+  - name: Ensure the mount directory exists
+    ansible.builtin.file:
+      path: /efs
+      state: directory
+      mode: '0755'
+    become: true
+
+  - name: Get current bastion instance information from AWS
+    amazon.aws.ec2_instance_info:
+      filters:
+          "tag:Name": "{{ inventory_hostname }}"
+    register:
+      ecw_instance_info_r
+
+  - name: Pick the EFS mount target in the same AZ
+    ansible.builtin.set_fact:
+      mount_target_f: "{{ efs_data_r.efs.mount_targets 
+        | selectattr('availability_zone_name','==',ecw_instance_info_r.instances[0].placement.availability_zone) 
+        | first }}"
+
+  - name: Ensure EFS volume is mounted.
+    ansible.posix.mount:
+      name: "/efs"
+      src: "{{ mount_target_f.ip_address }}:/"
+      fstype: nfs4
+      opts: nfsvers=4.1
+      state: mounted
+    become: true
+
+  - name: Ensure the mount directory exists
+    ansible.builtin.file:
+      path: /efs/data
+      state: directory
+      mode: '0755'
+      owner: ubuntu
+      group: ubuntu
+    become: true
+
+    # TODO - we can use the metadata file to determine the URI without needing the continent, if
+    #        we are feeling benevolent to our configuration user.
+  - name: Retreive the name of the latest file
+    ansible.builtin.uri:
+        method: HEAD
+        url: https://download.geofabrik.de/{{ osm_continent_v }}/{{ osm_region_v }}-latest.osm.pbf
+    register: redirect_r
+
+  - name: Pull the md5 checksum for the file we're about to download
+    ansible.builtin.uri:
+        method: GET
+        url: "{{ redirect_r.url }}.md5"
+        return_content: yes
+    register: md5_r
+
+  - name: Download the map file
+    ansible.builtin.get_url:
+        url: "{{ redirect_r.url }}"
+        dest: "/efs/data/{{ redirect_r.url | split('/') | last }}"
+        checksum: "md5:{{ md5_r.content.split(' ')|first }}"
+  
+  - name: Download two additional n7m data files
+    ansible.builtin.get_url:
+        url: "https://nominatim.org/data/{{ item }}"
+        dest: "/efs/data/{{ item }}"
+    loop:
+        - country_grid.sql.gz
+        - wikimedia-importance.sql.gz

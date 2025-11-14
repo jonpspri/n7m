@@ -56,10 +56,38 @@
           vpc-id: "{{ vpc_id }}"
       register: subnet_info
 
+    # RETRIEVE EC2 INSTANCES (BASTION)
+    - name: Get EC2 instances for VPC
+      amazon.aws.ec2_instance_info:
+        region: "{{ region_v }}"
+        filters:
+          vpc-id: "{{ vpc_id }}"
+          instance-state-name: [running, stopped, stopping, pending]
+          "tag:Project": "{{ prefix_v }}"
+      register: ec2_info
+
+    # RETRIEVE SECURITY GROUPS
+    - name: Get security groups for VPC
+      amazon.aws.ec2_security_group_info:
+        region: "{{ region_v }}"
+        filters:
+          vpc-id: "{{ vpc_id }}"
+      register: sg_info
+
     - name: Route Tables
       ansible.builtin.debug:
         var: route_tables_info.route_tables
         verbosity: 2
+
+    # DELETE EC2 INSTANCES (BASTION)
+    - name: Terminate EC2 instances
+      amazon.aws.ec2_instance:
+        region: "{{ region_v }}"
+        instance_ids: "{{ item.instance_id }}"
+        state: absent
+        wait: yes
+      loop: "{{ ec2_info.instances }}"
+      when: ec2_info.instances | length > 0
 
     # DELETE ROUTE TABLES (except main)
     - name: Delete custom route tables
@@ -96,6 +124,30 @@
         vpc_id: "{{ vpc_id }}"
         state: absent
       when: igw_info.internet_gateways | length > 0
+
+    # DELETE SECURITY GROUPS (except default)
+    # Delete ECS security groups explicitly first
+    - name: Delete ECS web security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-ecs-web-sg"
+        state: absent
+      ignore_errors: yes
+
+    - name: Delete ECS feed security group
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        name: "{{ prefix_v }}-ecs-feed-sg"
+        state: absent
+      ignore_errors: yes
+
+    - name: Delete security groups
+      amazon.aws.ec2_security_group:
+        region: "{{ region_v }}"
+        group_id: "{{ item.group_id }}"
+        state: absent
+      loop: "{{ sg_info.security_groups }}"
+      when: item.group_name != 'default'
 
     # DELETE SUBNETS
     - name: Delete subnets

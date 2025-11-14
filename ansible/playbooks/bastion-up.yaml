@@ -1,0 +1,59 @@
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+    # Get VPC public subnets
+    - name: Get VPC public subnets
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ region_v }}"
+        filters:
+          "tag:Project": "{{ prefix_v }}"
+          "map-public-ip-on-launch": true
+      register: vpc_public_subnet_f
+
+    # Get bastion security group
+    - name: Get Bastion Security Group
+      amazon.aws.ec2_security_group_info:
+        region: "{{ region_v }}"
+        filters:
+          "tag:Name": "{{ prefix_v }}-bastion-sg"
+      register: bastion_sg_f
+
+    # CREATE BASTION INSTANCE
+    - name: Creating Bastion Host
+      amazon.aws.ec2_instance:
+        state: running
+        key_name: "{{ keypair_v }}"
+        region: "{{ region_v }}"
+        instance_type: "{{ instance_type_v }}"
+        image:
+          id: "{{ bastion_ami_v }}"
+        wait: yes
+        wait_timeout: 300
+        tags:
+          Name: "{{ prefix_v }}-bastion"
+          Project: "{{ prefix_v }}"
+          Owner: "{{ owner_v }}"
+          Role: "bastion"
+        exact_count: 1
+        filters:
+          "tag:Name": "{{ prefix_v }}-bastion"
+          "instance-state-name": "running"
+        network_interfaces:
+          - assign_public_ip: true
+            groups:
+              - "{{ bastion_sg_f.security_groups[0].group_id }}"
+            subnet_id: "{{ vpc_public_subnet_f.subnets[0].id }}"
+      register: bastionHost_out
+
+    - name: Refresh inventory
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Wait for SSH to become available on bastion
+      ansible.builtin.wait_for:
+        host: "{{ bastionHost_out.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+      connection: local
