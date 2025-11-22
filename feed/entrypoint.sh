@@ -1,15 +1,16 @@
 #!/bin/bash
 
-set -e
+set -euxo pipefail
 
 # Export this for the Nominatim CLI
 export NOMINATIM_DATABASE_DSN="pgsql:dbname=nominatim;host=$PGHOST;user=$PGUSER;password=$PGPASSWORD"
-export PROCESSING_UNITS=$(nproc)
+
+PROCESSING_UNITS=$(nproc)
+export PROCESSING_UNITS
 
 function waitForGis() {
   # wait for gis container to reach a ready state
-  while ! psql --list > /dev/null 2>&1
-  do
+  while ! psql --list >/dev/null 2>&1; do
     echo "Connecting to $PGHOST..."
     sleep 5
   done
@@ -17,8 +18,7 @@ function waitForGis() {
 
 function waitForGisDatabase() {
   # wait for gis container to reach a ready state
-  while ! psql --list | grep $1 > /dev/null 2>&1
-  do
+  while ! psql --list | grep "$1" >/dev/null 2>&1; do
     echo "Waiting for $PGHOST/$1..."
     sleep 10
   done
@@ -55,10 +55,13 @@ if [ "$1" = 'setup' ]; then
 
   OSM_PATH=/data/$OSM_FILENAME
 
-  if [ -s ${OSM_PATH} ]; then
+  if [ -s "${OSM_PATH}" ]; then
     echo "$OSM_PATH exists."
   else
-    echo "Database $OSM_PATH does not exist.  Please specify variable 'OSM_FILENAME'  Exiting."
+    echo "Database '$OSM_PATH' does not exist.  Please specify variable 'OSM_FILENAME'."
+    echo "Contents of /data:"
+    ls -l /data
+    echo "Exiting."
     exit 1
   fi
 
@@ -69,7 +72,7 @@ if [ "$1" = 'setup' ]; then
   echo "Number of processing units: $PROCESSING_UNITS"
 
   # time the import so we can compare database configuration
-  time nominatim import $NOMINATIM_IMPORT_FLAGS --osm-file /data/$OSM_FILENAME --project-dir /data --threads $PROCESSING_UNITS
+  time nominatim import "$NOMINATIM_IMPORT_FLAGS" --osm-file "/data/$OSM_FILENAME" --project-dir /data --threads "$PROCESSING_UNITS"
   if [ $? != 0 ]; then
     echo "Import failed"
     exit 1
@@ -82,8 +85,8 @@ fi
 if [ "$1" = 'update' ]; then
   # run replication once
   # any scheduling should be done outside this container
-  
-  # set this if you want to be more aggressive 
+
+  # set this if you want to be more aggressive
   # https://nominatim.org/release-docs/latest/customize/Settings/
   # NOMINATIM_REPLICATION_MAX_DIFF=3000
 
@@ -94,7 +97,7 @@ if [ "$1" = 'update' ]; then
   echo "Number of processing units: $PROCESSING_UNITS"
 
   nominatim replication --init
-  exec nominatim replication --once --threads $PROCESSING_UNITS
+  exec nominatim replication --once --threads "$PROCESSING_UNITS"
 fi
 
 if [ "$1" = 'replication' ]; then
@@ -106,7 +109,7 @@ if [ "$1" = 'replication' ]; then
   echo "Number of processing units: $PROCESSING_UNITS"
 
   nominatim replication --init
-  exec nominatim "$@" --threads $PROCESSING_UNITS
+  exec nominatim "$@" --threads "$PROCESSING_UNITS"
 fi
 
 exec "$@"
